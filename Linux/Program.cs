@@ -1123,6 +1123,10 @@ public sealed partial class Previews : ITrayActions, ISettingsHost
         // S6: "Include clients at the login screen" (IncludeLoginScreensInCycle, ThumbnailManager.CycleAll): the next / previous
         // keys also go to the login-screen thumbnails, and every client is then walked in window order, as on Windows.
         if (order == null && S.IncludeLoginScreensInCycle) windows = windows.OrderBy(w => w).ToList();
+        // Home › Switching › Cycle order (ThumbnailManager.CycleAll): the profile's listed characters first, then the rest.
+        if (order == null)
+            windows = CycleOrder.Apply(windows, w => _thumbs.TryGetValue(w, out var t) ? t.Client.Character : null,
+                _settings.CurrentProfile.CycleOrder);
         if (windows.Count == 0) return;
         var options = CycleFilterOptions.From(S);
         if (CycleFilter.Changed(ref _cycleSwitches, options)) { _groupCycleWalk.Forget(); _allCycleWalk.Forget(); }
@@ -1569,8 +1573,10 @@ public sealed partial class Previews : ITrayActions, ISettingsHost
         if (S.EnableUnderFireIndicator) _underFire[character] = DateTime.UtcNow;
     }
 
-    /// <summary>The pulsing red border of a client taking damage (at least 3 px, alpha 168 ± 87 on a 50 ms × 0.15 rad step, as
-    /// the Windows thumbnail draws it) for UnderFireTimeoutSeconds after the last hit. An alert's own border wins while it shows.</summary>
+    /// <summary>The pulsing red border of a client taking damage (at least 3 px, alpha 168 ± 87 on a 250 ms × 0.75 rad step, as
+    /// the Windows thumbnail draws it) for UnderFireTimeoutSeconds after the last hit. An alert's own border wins while it shows.
+    /// The alpha changes only every 250 ms, so Apply's early-out holds between steps: every changed look is a repaint the
+    /// compositor puts over the clients, and a fight puts every client under fire at once.</summary>
     private ThumbnailLook UnderFireLook(string character, ThumbnailLook look)
     {
         if (!_underFire.TryGetValue(character, out var last)) return look;
@@ -1581,7 +1587,7 @@ public sealed partial class Previews : ITrayActions, ISettingsHost
             return look;
         }
         if (_alertBorders.ContainsKey(character)) return look;
-        double phase = Environment.TickCount64 / 50 * 0.15;
+        double phase = Environment.TickCount64 / UnderFirePulseMs * 0.75;
         byte alpha = (byte)Math.Clamp(168 + 87 * Math.Sin(phase), 0, 255);
         return look with { Border = UnderFireBrush(alpha), BorderThickness = Math.Max(3, look.BorderThickness) };
     }
@@ -1589,6 +1595,9 @@ public sealed partial class Previews : ITrayActions, ISettingsHost
     /// <summary>One brush per alpha, made once: the same alpha then gives the same look, so Apply's early-out holds and a
     /// fight allocates nothing per tick.</summary>
     private static readonly SolidColorBrush?[] UnderFireBrushes = new SolidColorBrush?[256];
+
+    /// <summary>ThumbnailWindow.UnderFirePulseMs on Windows: the under-fire pulse steps 4 times a second.</summary>
+    public const int UnderFirePulseMs = 250;
 
     public static SolidColorBrush UnderFireBrush(byte alpha) =>
         UnderFireBrushes[alpha] ??= new SolidColorBrush(Color.FromArgb(alpha, 255, 40, 40));
