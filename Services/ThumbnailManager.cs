@@ -1,4 +1,4 @@
-﻿using System;
+﻿﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -397,11 +397,12 @@ public sealed class ThumbnailManager : IDisposable
         _raiseOverlaysDebounce.Tick += (_, _) =>
         {
             _raiseOverlaysDebounce?.Stop();
+            using var op = StallWatch.Op("raise overlays");
             RaiseThumbnailsAboveOverlays();
         };
 
         _focusTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
-        _focusTimer.Tick += (_, _) => UpdateActiveBorders();
+        _focusTimer.Tick += (_, _) => { using var op = StallWatch.Op("focus sweep"); UpdateActiveBorders(); };
         _focusTimer.Start();
 
         // Event-driven wake-ups for sub-frame border response. The hook fires
@@ -417,22 +418,22 @@ public sealed class ThumbnailManager : IDisposable
 
         // Session timer — 1 second intervals
         _sessionTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
-        _sessionTimer.Tick += (_, _) => { UpdateSessionTimers(); UpdateJumpCounts(); CheckUnderFireExpiry(); };
+        _sessionTimer.Tick += (_, _) => { using var op = StallWatch.Op("session timers"); UpdateSessionTimers(); UpdateJumpCounts(); CheckUnderFireExpiry(); };
         _sessionTimer.Start();
 
         // Flash timer — 100ms for urgent, responsive alert flashing (10Hz)
         _flashTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
-        _flashTimer.Tick += (_, _) => { FlashAlertTick(); EnlargeTick(); };
+        _flashTimer.Tick += (_, _) => { using var op = StallWatch.Op("alert flash"); FlashAlertTick(); EnlargeTick(); };
         _flashTimer.Start();
 
         // Stat overlay update timer — 1s interval for DPS/Logi/Mining/Ratting
         _statTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
-        _statTimer.Tick += (_, _) => UpdateStatWindows();
+        _statTimer.Tick += (_, _) => { using var op = StallWatch.Op("stat overlays"); UpdateStatWindows(); };
         _statTimer.Start();
 
         // FPS polling timer — 500ms interval for real-time overlay
         _fpsTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
-        _fpsTimer.Tick += (_, _) => UpdateFpsOverlays();
+        _fpsTimer.Tick += (_, _) => { using var op = StallWatch.Op("FPS overlays"); UpdateFpsOverlays(); };
         _fpsTimer.Start();
 
         StartMonitorFollowing();
@@ -2583,6 +2584,13 @@ public sealed class ThumbnailManager : IDisposable
         }
     }
 
+    /// <summary>The stall recorder's line of state (StallWatch): read on its thread, which the concurrent dictionaries allow.</summary>
+    internal string StallContext() => $"clients {_thumbnails.Count}, alerts flashing {_alertFlashChars.Count}, under fire {_underFireChars.Count}";
+
+    /// <summary>The clients the stall recorder asks whether they still answer (StallWatch.ClientRef).</summary>
+    internal IReadOnlyList<StallWatch.ClientRef> StallClients() =>
+        _thumbnails.Select(kv => new StallWatch.ClientRef(kv.Value.CharacterName, kv.Key)).ToList();
+
     private bool _lastManageAffinityState = false;
 
     private void ManageCpuAffinity(IntPtr activeHwnd, AppSettings s)
@@ -2616,7 +2624,9 @@ public sealed class ThumbnailManager : IDisposable
                 if (pid > 0)
                 {
                     var p = Process.GetProcessById(pid);
-                    activeEves.Add((p, thumb.CharacterName, hwnd == activeHwnd));
+                    // A client under fire keeps its full share even in the background: starving it mid-fight
+                    // froze its screen (lock-ups reported in 3.1.9 with this setting on).
+                    activeEves.Add((p, thumb.CharacterName, hwnd == activeHwnd || _underFireChars.ContainsKey(thumb.CharacterName)));
                 }
             }
             catch { /* Process might have just exited */ }
@@ -2640,9 +2650,10 @@ public sealed class ThumbnailManager : IDisposable
                 }
                 else
                 {
-                    // Inactive client: Idle priority
-                    if (eve.Proc.PriorityClass != ProcessPriorityClass.Idle)
-                        eve.Proc.PriorityClass = ProcessPriorityClass.Idle;
+                    // Inactive client: Below normal, never Idle. Idle threads run only when nothing at Normal
+                    // wants the processor, so in a fight background clients got no time at all and froze.
+                    if (eve.Proc.PriorityClass != ProcessPriorityClass.BelowNormal)
+                        eve.Proc.PriorityClass = ProcessPriorityClass.BelowNormal;
 
                     // Inactive Core Assignment
                     long affinityMask = 0;
@@ -2670,7 +2681,7 @@ public sealed class ThumbnailManager : IDisposable
                     }
                     else
                     {
-                        // Restore to all cores but keep 'Idle' priority
+                        // Restore to all cores but keep 'Below normal' priority
                         long allCoresMask = AllCoresMask();
                         if ((long)eve.Proc.ProcessorAffinity != allCoresMask)
                             eve.Proc.ProcessorAffinity = (IntPtr)allCoresMask;
